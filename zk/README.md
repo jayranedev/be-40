@@ -50,8 +50,16 @@ Replace `expectedCommitment` with the Poseidon hash of the embedding and salt (c
 ## Example workflow (snarkjs)
 
 ```bash
+# Prereqs (from zk/)
+# - Install circom: https://docs.circom.io/getting-started/installation/
+# - Install local dependencies:
+npm install
+
+# 0) Compute a commitment that matches the input
+node scripts/compute_commitment.js input.example.json input.json
+
 # 1) Compile the circuit
-circom face_identity.circom --r1cs --wasm --sym
+circom face_identity.circom --r1cs --wasm --sym -l node_modules
 
 # 2) Generate a witness
 node face_identity_js/generate_witness.js face_identity_js/face_identity.wasm input.json witness.wtns
@@ -60,9 +68,9 @@ node face_identity_js/generate_witness.js face_identity_js/face_identity.wasm in
 # (Use an appropriate ceremony or a trusted setup in production)
 
 # 4) Prove and verify (Groth16 example)
-# snarkjs groth16 setup face_identity.r1cs pot12_final.ptau face_identity_0000.zkey
-# snarkjs groth16 prove face_identity_0000.zkey witness.wtns proof.json public.json
-# snarkjs groth16 verify verification_key.json public.json proof.json
+# npx snarkjs groth16 setup face_identity.r1cs pot12_final.ptau face_identity_0000.zkey
+# npx snarkjs groth16 prove face_identity_0000.zkey witness.wtns proof.json public.json
+# npx snarkjs groth16 verify verification_key.json public.json proof.json
 ```
 
 ## Security & privacy notes
@@ -85,14 +93,24 @@ Use this flow to show a live demo to classmates or reviewers. It avoids exposing
 
 ```bash
 # From the zk/ directory
-circom face_identity.circom --r1cs --wasm --sym
-node face_identity_js/generate_witness.js face_identity_js/face_identity.wasm input.example.json witness.wtns
+npm install
+node scripts/compute_commitment.js input.example.json input.json
+circom face_identity.circom --r1cs --wasm --sym -l node_modules
+node face_identity_js/generate_witness.js face_identity_js/face_identity.wasm input.json witness.wtns
 
 # Example Groth16 flow
-snarkjs groth16 setup face_identity.r1cs pot12_final.ptau face_identity_0000.zkey
-snarkjs zkey export verificationkey face_identity_0000.zkey verification_key.json
-snarkjs groth16 prove face_identity_0000.zkey witness.wtns proof.json public.json
-snarkjs groth16 verify verification_key.json public.json proof.json
+npx snarkjs groth16 setup face_identity.r1cs pot12_final.ptau face_identity_0000.zkey
+npx snarkjs zkey export verificationkey face_identity_0000.zkey verification_key.json
+npx snarkjs groth16 prove face_identity_0000.zkey witness.wtns proof.json public.json
+npx snarkjs groth16 verify verification_key.json public.json proof.json
+```
+
+## One-command demo
+
+If you already have `circom` installed, you can run the full demo flow (including a local powers-of-tau setup) with:
+
+```bash
+./run_demo.sh
 ```
 
 3. **What to show during the demo**
