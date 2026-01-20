@@ -71,3 +71,36 @@ node face_identity_js/generate_witness.js face_identity_js/face_identity.wasm in
 - Use strong salting and consider key-derivation/hardware-backed secrets for the salt.
 - The embedding model and preprocessing must be consistent across registration and verification.
 - Face embeddings are biometric data; handle them according to privacy regulations.
+
+## Demo for others (step-by-step)
+
+Use this flow to show a live demo to classmates or reviewers. It avoids exposing the face image by using a precomputed embedding.
+
+1. **Prepare a demo embedding**
+   - Use the sample `input.example.json` as a stand-in, or replace the `embedding` array with one you computed off-chain.
+   - Pick a random `salt` (keep it private) and compute the Poseidon commitment off-chain.
+   - Update `expectedCommitment` in the JSON to the computed value.
+
+2. **Compile and generate proof**
+
+```bash
+# From the zk/ directory
+circom face_identity.circom --r1cs --wasm --sym
+node face_identity_js/generate_witness.js face_identity_js/face_identity.wasm input.example.json witness.wtns
+
+# Example Groth16 flow
+snarkjs groth16 setup face_identity.r1cs pot12_final.ptau face_identity_0000.zkey
+snarkjs zkey export verificationkey face_identity_0000.zkey verification_key.json
+snarkjs groth16 prove face_identity_0000.zkey witness.wtns proof.json public.json
+snarkjs groth16 verify verification_key.json public.json proof.json
+```
+
+3. **What to show during the demo**
+   - Show the **public commitment** (`expectedCommitment`) that was registered.
+   - Show that the proof verifies successfully without revealing the face embedding.
+   - Explain that the embedding would come from a face model (e.g., FaceNet/ArcFace) and the raw image never leaves the device.
+
+4. **Talking points**
+   - The verifier only learns the commitment and a valid proof, not the face data.
+   - The same commitment can be checked across services without sharing biometrics.
+   - This demo proves knowledge of the embedding; production systems should add liveness checks and secure enrollment.
