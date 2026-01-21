@@ -14,10 +14,12 @@
     "@tensorflow/tfjs-converter": "^4.20.0",
     "@tensorflow/tfjs-core": "^4.20.0",
     "@web3modal/wagmi": "^4.1.7",
+    "circomlibjs": "^0.1.7",
     "face-api.js": "^0.22.2",
     "framer-motion": "^11.2.10",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "snarkjs": "^0.7.2",
     "viem": "^2.16.2",
     "wagmi": "^2.10.2"
   },
