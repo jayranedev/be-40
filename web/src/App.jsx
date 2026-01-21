@@ -11,6 +11,8 @@ import { hasProjectId } from './wallet.js';
 import { identityAbi } from './lib/identityAbi.js';
 import { BASE_SEPOLIA_CHAIN_ID, IDENTITY_CONTRACT_ADDRESS, IDENTITY_OWNER_ADDRESS } from './lib/contract.js';
 import { loadTemplate, saveTemplate } from './lib/biometricStore.js';
+import { DISTANCE_THRESHOLD, MATCH_THRESHOLD } from './lib/zkConfig.js';
+import { formatProofForSolidity, generateFaceProof } from './lib/zkProof.js';
 
 const views = [
   { id: 'home', label: 'Landing' },
@@ -39,7 +41,6 @@ const itemVariants = {
 
 const REQUIRED_BLINKS = 2;
 const EYE_AR_THRESHOLD = 0.23;
-const MATCH_THRESHOLD = 0.5;
 
 function distance(a, b) {
   return Math.hypot(a.x - b.x, a.y - b.y);
@@ -74,6 +75,9 @@ export default function App() {
   const [loginDescriptor, setLoginDescriptor] = useState(null);
   const [loginResult, setLoginResult] = useState('');
   const [loginScore, setLoginScore] = useState(null);
+  const [zkResult, setZkResult] = useState('');
+  const [zkPending, setZkPending] = useState(false);
+  const [enrollTemplate, setEnrollTemplate] = useState(null);
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const rafRef = useRef(null);
@@ -188,6 +192,12 @@ export default function App() {
     query: { enabled: Boolean(verifyTokenId && verifyTokenId > 0n) },
   });
 
+  const { data: onchainDistanceThreshold } = useReadContract({
+    address: IDENTITY_CONTRACT_ADDRESS,
+    abi: identityAbi,
+    functionName: 'distanceThreshold',
+  });
+
   const { writeContract, data: txHash, isPending } = useWriteContract();
   const {
     data: txReceipt,
@@ -219,6 +229,7 @@ export default function App() {
       setLoginDescriptor(null);
       setLoginResult('');
       setLoginScore(null);
+      setZkResult('');
       lastEyeOpenRef.current.login = true;
       livenessRef.current.login = false;
     }
@@ -380,16 +391,17 @@ export default function App() {
         targetWallet: wallet,
       });
       setEnrollWallet(wallet);
+      setEnrollTemplate({ descriptor: enrollDescriptor, nonce, version: 1 });
     } catch (error) {
       setEnrollError(error?.shortMessage || 'Transaction failed to submit.');
     }
   };
 
   useEffect(() => {
-    if (isConfirmed && enrollWallet && enrollDescriptor) {
-      saveTemplate(enrollWallet, enrollDescriptor);
+    if (isConfirmed && enrollWallet && enrollTemplate) {
+      saveTemplate(enrollWallet, enrollTemplate);
     }
-  }, [isConfirmed, enrollWallet, enrollDescriptor]);
+  }, [isConfirmed, enrollWallet, enrollTemplate]);
 
   const handleLoginCheck = () => {
     setLoginResult('');
@@ -399,16 +411,71 @@ export default function App() {
       return;
     }
     const stored = loadTemplate(wallet);
-    if (!stored) {
+    if (!stored?.descriptor) {
       setLoginResult('No enrolled template found for this wallet.');
       return;
     }
-    const distance = faceapi.euclideanDistance(loginDescriptor, stored);
+    const distance = faceapi.euclideanDistance(loginDescriptor, stored.descriptor);
     setLoginScore(distance);
     if (distance <= MATCH_THRESHOLD) {
       setLoginResult('Match confirmed. Same person.');
     } else {
       setLoginResult('No match. Face does not match the enrolled owner.');
+    }
+  };
+
+  const handleZkVerify = async () => {
+    setZkResult('');
+    if (!isConnected) {
+      setZkResult('Connect your wallet before verifying a proof.');
+      return;
+    }
+    if (!isCorrectChain) {
+      setZkResult('Switch to Base Sepolia (84532) before verifying a proof.');
+      return;
+    }
+    if (!loginDescriptor) {
+      setZkResult('Complete liveness and capture a face first.');
+      return;
+    }
+    const stored = loadTemplate(wallet);
+    if (!stored?.descriptor || !stored.nonce) {
+      setZkResult('Missing enrolled template or nonce for this wallet.');
+      return;
+    }
+    if (!walletTokenId || walletTokenId === 0n) {
+      setZkResult('No on-chain identity found for this wallet.');
+      return;
+    }
+    if (!publicClient) {
+      setZkResult('No public client available for verification.');
+      return;
+    }
+    setZkPending(true);
+    try {
+      const threshold =
+        onchainDistanceThreshold && onchainDistanceThreshold > 0n
+          ? onchainDistanceThreshold
+          : DISTANCE_THRESHOLD;
+      const { proof } = await generateFaceProof({
+        liveDescriptor: loginDescriptor,
+        enrolledDescriptor: stored.descriptor,
+        nonce: stored.nonce,
+        version: stored.version ?? 1,
+        distanceThreshold: threshold,
+      });
+      const { a, b, c } = formatProofForSolidity(proof);
+      const verified = await publicClient.readContract({
+        address: IDENTITY_CONTRACT_ADDRESS,
+        abi: identityAbi,
+        functionName: 'verifyFaceProof',
+        args: [walletTokenId, a, b, c],
+      });
+      setZkResult(verified ? 'ZK proof verified on-chain.' : 'ZK proof verification failed.');
+    } catch (error) {
+      setZkResult(error?.shortMessage || error?.message || 'Failed to verify ZK proof.');
+    } finally {
+      setZkPending(false);
     }
   };
 
@@ -737,6 +804,13 @@ export default function App() {
                   >
                     Verify login
                   </button>
+                  <button
+                    className="button secondary"
+                    onClick={handleZkVerify}
+                    disabled={!loginLivenessPassed || !loginDescriptor || zkPending}
+                  >
+                    {zkPending ? 'Verifying ZK proof...' : 'Verify with ZK'}
+                  </button>
                 </div>
                 {loginResult && (
                   <div style={{ marginTop: 12 }}>
@@ -746,6 +820,11 @@ export default function App() {
                         Distance score: {loginScore.toFixed(3)} (threshold {MATCH_THRESHOLD})
                       </div>
                     )}
+                  </div>
+                )}
+                {zkResult && (
+                  <div style={{ marginTop: 12 }}>
+                    <span className="badge">{zkResult}</span>
                   </div>
                 )}
               </motion.div>
