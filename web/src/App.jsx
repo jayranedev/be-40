@@ -9,7 +9,7 @@ import { setBackend } from '@tensorflow/tfjs-core';
 import { makeCommitmentFromEmbedding, randomHex } from './lib/crypto.js';
 import { hasProjectId } from './wallet.js';
 import { identityAbi } from './lib/identityAbi.js';
-import { BASE_SEPOLIA_CHAIN_ID, IDENTITY_CONTRACT_ADDRESS, IDENTITY_OWNER_ADDRESS } from './lib/contract.js';
+import { BASE_SEPOLIA_CHAIN_ID, IDENTITY_CONTRACT_ADDRESS, IDENTITY_DEPLOY_BLOCK, IDENTITY_OWNER_ADDRESS } from './lib/contract.js';
 import {
   hasEncryptedTemplate,
   hasTemplate,
@@ -116,14 +116,19 @@ export default function App() {
   const [proofsFeed, setProofsFeed] = useState([]);
   const [proofsLoading, setProofsLoading] = useState(false);
   const [proofsError, setProofsError] = useState('');
+  const [proofsRefreshTick, setProofsRefreshTick] = useState(0);
   const [proofsFromBlock, setProofsFromBlock] = useState('');
   const [proofsToBlock, setProofsToBlock] = useState('');
   const [proofsWindowSize, setProofsWindowSize] = useState(PROOFS_WINDOW.toString());
+  const [proofsAllHistory, setProofsAllHistory] = useState(true);
+  const [proofPage, setProofPage] = useState(1);
+  const [proofPageSize, setProofPageSize] = useState(5);
   const [csvStatus, setCsvStatus] = useState('');
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState('');
   const [searchMintLog, setSearchMintLog] = useState(null);
   const [searchRevokeLog, setSearchRevokeLog] = useState(null);
+  const [searchRan, setSearchRan] = useState(false);
   const [proofAction, setProofAction] = useState('');
   const [proofError, setProofError] = useState('');
   const [lastProof, setLastProof] = useState(null);
@@ -134,6 +139,7 @@ export default function App() {
   const livenessRef = useRef({ enroll: false, login: false });
   const activeModeRef = useRef('enroll');
   const modelLoadedRef = useRef(false);
+  const proofFeedKeyRef = useRef('');
 
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
@@ -223,6 +229,30 @@ export default function App() {
     }
   };
 
+  const withTimeout = (promise, ms) =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('Log query timed out.')), ms);
+      promise
+        .then((value) => {
+          clearTimeout(timer);
+          resolve(value);
+        })
+        .catch((error) => {
+          clearTimeout(timer);
+          reject(error);
+        });
+    });
+
+  const parsedFromBlock = useMemo(() => parseBlockInput(proofsFromBlock), [proofsFromBlock]);
+  const parsedToBlock = useMemo(() => parseBlockInput(proofsToBlock), [proofsToBlock]);
+  const computedWindowSize = useMemo(() => {
+    if (!currentBlock && parsedToBlock === null) return null;
+    const toValue = parsedToBlock !== null ? parsedToBlock : currentBlock;
+    if (parsedFromBlock === null || toValue === null) return null;
+    if (toValue < parsedFromBlock) return null;
+    return toValue - parsedFromBlock;
+  }, [currentBlock, parsedFromBlock, parsedToBlock]);
+
 
   const {
     data: walletTokenId,
@@ -301,6 +331,7 @@ export default function App() {
     if (isConfirmed) {
       refetchWalletTokenId();
       refetchWalletIdentity();
+      setProofsRefreshTick((prev) => prev + 1);
     }
   }, [isConfirmed, refetchWalletTokenId, refetchWalletIdentity]);
 
@@ -312,7 +343,7 @@ export default function App() {
       try {
         const blockNumber = await publicClient.getBlockNumber();
         if (active) {
-          setCurrentBlock(blockNumber);
+          setCurrentBlock((prev) => (prev === blockNumber ? prev : blockNumber));
         }
       } catch (error) {
         if (active) {
@@ -321,7 +352,7 @@ export default function App() {
       }
     };
     fetchBlock();
-    timer = setInterval(fetchBlock, 15000);
+    timer = setInterval(fetchBlock, 45000);
     return () => {
       active = false;
       clearInterval(timer);
@@ -331,12 +362,19 @@ export default function App() {
   useEffect(() => {
     if (!currentBlock) return;
     if (!proofsFromBlock && !proofsToBlock) {
-      const windowSize = parseBlockInput(proofsWindowSize) ?? PROOFS_WINDOW;
-      const fromBlock = currentBlock > windowSize ? currentBlock - windowSize : 0n;
+      const fromBlock = IDENTITY_DEPLOY_BLOCK ?? 0n;
       setProofsFromBlock(fromBlock.toString());
       setProofsToBlock(currentBlock.toString());
     }
-  }, [currentBlock, proofsFromBlock, proofsToBlock, proofsWindowSize]);
+  }, [currentBlock, proofsFromBlock, proofsToBlock]);
+
+  useEffect(() => {
+    if (computedWindowSize === null) return;
+    const nextValue = computedWindowSize.toString();
+    if (nextValue !== proofsWindowSize) {
+      setProofsWindowSize(nextValue);
+    }
+  }, [computedWindowSize, proofsWindowSize]);
 
   const resetLiveness = (mode) => {
     if (mode === 'enroll') {
@@ -624,6 +662,21 @@ export default function App() {
     return status === 0 ? 'Verified' : 'Revoked';
   }, [verifyWallet, isVerifyWalletValid, verifyTokenId, verifyIdentity]);
 
+  const pagedProofs = useMemo(() => {
+    const start = (proofPage - 1) * proofPageSize;
+    return proofsFeed.slice(start, start + proofPageSize);
+  }, [proofPage, proofPageSize, proofsFeed]);
+
+  const proofTotalPages = useMemo(() => {
+    return Math.max(1, Math.ceil(proofsFeed.length / proofPageSize));
+  }, [proofPageSize, proofsFeed.length]);
+
+  const showVerifyReadError = useMemo(() => {
+    if (!verifyResult) return false;
+    if (verifyResult === 'Not verified') return false;
+    return Boolean(verifyTokenError || verifyIdentityError);
+  }, [verifyResult, verifyTokenError, verifyIdentityError]);
+
   const loginMatched = useMemo(() => {
     return Boolean(loginScore !== null && loginScore <= MATCH_THRESHOLD);
   }, [loginScore]);
@@ -681,6 +734,38 @@ export default function App() {
     if (!publicClient || view !== 'proofs') return;
     let active = true;
     let timer;
+    const fetchLogsPaged = async (event, fromBlock, toBlock, pageSize = 5000n) => {
+      if (fromBlock === null || fromBlock === undefined || toBlock === null || toBlock === undefined || fromBlock >= toBlock) {
+        return withTimeout(
+          publicClient.getLogs({
+            address: IDENTITY_CONTRACT_ADDRESS,
+            event,
+            fromBlock,
+            toBlock: toBlock ?? 'latest',
+          }),
+          20000
+        );
+      }
+      const pages = [];
+      let start = fromBlock;
+      while (start <= toBlock) {
+        const end = start + pageSize > toBlock ? toBlock : start + pageSize;
+        const logs = await withTimeout(
+          publicClient.getLogs({
+            address: IDENTITY_CONTRACT_ADDRESS,
+            event,
+            fromBlock: start,
+            toBlock: end,
+          }),
+          20000
+        );
+        pages.push(...logs);
+        if (end === toBlock) break;
+        start = end + 1n;
+      }
+      return pages;
+    };
+
     const fetchProofs = async () => {
       setProofsLoading(true);
       setProofsError('');
@@ -690,33 +775,25 @@ export default function App() {
           currentBlock && currentBlock > windowSize ? currentBlock - windowSize : 0n;
         let fromBlock = parseBlockInput(proofsFromBlock);
         let toBlock = parseBlockInput(proofsToBlock);
-        if (fromBlock === null) {
-          fromBlock = autoFrom;
+        if (proofsAllHistory) {
+          fromBlock = IDENTITY_DEPLOY_BLOCK ?? 0n;
+          toBlock = null;
+        } else {
+          if (fromBlock === null) {
+            fromBlock = autoFrom;
+          }
+          if (toBlock !== null && toBlock < fromBlock) {
+            const swap = fromBlock;
+            fromBlock = toBlock;
+            toBlock = swap;
+          }
         }
-        if (toBlock !== null && toBlock < fromBlock) {
-          const swap = fromBlock;
-          fromBlock = toBlock;
-          toBlock = swap;
-        }
+        const resolvedToBlock =
+          toBlock ?? (currentBlock !== null && currentBlock !== undefined ? currentBlock : 'latest');
         const [mintedLogs, revokedLogs, authLogs] = await Promise.all([
-          publicClient.getLogs({
-            address: IDENTITY_CONTRACT_ADDRESS,
-            event: identityMintedEvent,
-            fromBlock,
-            toBlock: toBlock ?? 'latest',
-          }),
-          publicClient.getLogs({
-            address: IDENTITY_CONTRACT_ADDRESS,
-            event: identityRevokedEvent,
-            fromBlock,
-            toBlock: toBlock ?? 'latest',
-          }),
-          publicClient.getLogs({
-            address: IDENTITY_CONTRACT_ADDRESS,
-            event: authProofEvent,
-            fromBlock,
-            toBlock: toBlock ?? 'latest',
-          }),
+          fetchLogsPaged(identityMintedEvent, fromBlock, resolvedToBlock),
+          fetchLogsPaged(identityRevokedEvent, fromBlock, resolvedToBlock),
+          fetchLogsPaged(authProofEvent, fromBlock, resolvedToBlock),
         ]);
         if (!active) return;
         const authFeed = (authLogs || []).map((log) => ({
@@ -749,10 +826,15 @@ export default function App() {
           if (a.blockNumber === b.blockNumber) return 0;
           return a.blockNumber > b.blockNumber ? -1 : 1;
         });
-        setProofsFeed(feed);
+        const nextKey = feed.map((item) => item.txHash).join('|');
+        if (nextKey !== proofFeedKeyRef.current) {
+          proofFeedKeyRef.current = nextKey;
+          setProofsFeed(feed);
+          setProofPage(1);
+        }
       } catch (error) {
         if (active) {
-          setProofsError('Failed to load realtime proofs. Check RPC or contract address.');
+          setProofsError(error?.message || 'Failed to load realtime proofs. Check RPC or contract address.');
         }
       } finally {
         if (active) {
@@ -761,7 +843,7 @@ export default function App() {
       }
     };
     fetchProofs();
-    timer = setInterval(fetchProofs, 15000);
+    timer = setInterval(fetchProofs, 45000);
     return () => {
       active = false;
       clearInterval(timer);
@@ -773,11 +855,14 @@ export default function App() {
     proofsFromBlock,
     proofsToBlock,
     proofsWindowSize,
+    proofsAllHistory,
+    proofsRefreshTick,
   ]);
 
   useEffect(() => {
     if (isAuthConfirmed) {
       setView('proofs');
+      setProofsRefreshTick((prev) => prev + 1);
     }
   }, [isAuthConfirmed]);
 
@@ -796,6 +881,7 @@ export default function App() {
     setSearchMintLog(null);
     setSearchRevokeLog(null);
     setSearchError('');
+    setSearchRan(false);
   }, [verifyWallet]);
 
   useEffect(() => {
@@ -822,6 +908,7 @@ export default function App() {
     setSearchError('');
     setSearchMintLog(null);
     setSearchRevokeLog(null);
+    setSearchRan(true);
     if (!publicClient) {
       setSearchError('RPC client unavailable.');
       return;
@@ -832,35 +919,66 @@ export default function App() {
     }
     setSearchLoading(true);
     try {
-      const fetchLogs = async (fromBlock, toBlock) =>
-        publicClient.getLogs({
-          address: IDENTITY_CONTRACT_ADDRESS,
-          event: identityMintedEvent,
-          args: { owner: verifyWallet },
-          fromBlock,
-          toBlock,
-        });
+      const fetchLogs = async (event, fromBlock, toBlock) => {
+        const pageSize = 5000n;
+        if (fromBlock === null || fromBlock === undefined || toBlock === null || toBlock === undefined || fromBlock >= toBlock) {
+          return withTimeout(
+            publicClient.getLogs({
+              address: IDENTITY_CONTRACT_ADDRESS,
+              event,
+              args: { owner: verifyWallet },
+              fromBlock,
+              toBlock,
+            }),
+            20000
+          );
+        }
+        const pages = [];
+        let start = fromBlock;
+        while (start <= toBlock) {
+          const end = start + pageSize > toBlock ? toBlock : start + pageSize;
+          const logs = await withTimeout(
+            publicClient.getLogs({
+              address: IDENTITY_CONTRACT_ADDRESS,
+              event,
+              args: { owner: verifyWallet },
+              fromBlock: start,
+              toBlock: end,
+            }),
+            20000
+          );
+          pages.push(...logs);
+          if (end === toBlock) break;
+          start = end + 1n;
+        }
+        return pages;
+      };
+      const resolvedToBlock =
+        currentBlock !== null && currentBlock !== undefined ? currentBlock : 'latest';
       let mintLogs = [];
       try {
-        mintLogs = await fetchLogs(0n, 'latest');
+        mintLogs = await fetchLogs(identityMintedEvent, IDENTITY_DEPLOY_BLOCK ?? 0n, resolvedToBlock);
       } catch (error) {
         if (!currentBlock) {
           throw error;
         }
         const windowSize = parseBlockInput(proofsWindowSize) ?? PROOFS_WINDOW;
         const fromBlock = currentBlock > windowSize ? currentBlock - windowSize : 0n;
-        mintLogs = await fetchLogs(fromBlock, 'latest');
+        mintLogs = await fetchLogs(identityMintedEvent, fromBlock, resolvedToBlock);
       }
       const latestMint = mintLogs[mintLogs.length - 1] || null;
       setSearchMintLog(latestMint);
       if (latestMint && verifyTokenId && verifyTokenId > 0n) {
-        const revokeLogs = await publicClient.getLogs({
-          address: IDENTITY_CONTRACT_ADDRESS,
-          event: identityRevokedEvent,
-          args: { tokenId: verifyTokenId },
-          fromBlock: latestMint.blockNumber ?? 0n,
-          toBlock: 'latest',
-        });
+        const revokeLogs = await withTimeout(
+          publicClient.getLogs({
+            address: IDENTITY_CONTRACT_ADDRESS,
+            event: identityRevokedEvent,
+            args: { tokenId: verifyTokenId },
+            fromBlock: latestMint.blockNumber ?? 0n,
+            toBlock: 'latest',
+          }),
+          20000
+        );
         setSearchRevokeLog(revokeLogs[revokeLogs.length - 1] || null);
       }
     } catch (error) {
@@ -1177,9 +1295,9 @@ export default function App() {
       <header className="header">
         <div>
           <div className="brand">
-            <div className="logo">F</div>
+            <div className="logo">ZKS</div>
             <div>
-              <div className="title">FaceID SBT Identity</div>
+              <div className="title">ZK-SOUL</div>
               <div className="subtitle">
                 Face-based verification, on-chain commitments, and secure session keys.
               </div>
@@ -1299,8 +1417,8 @@ export default function App() {
                   <div>
                     <label className="label">Window size (blocks)</label>
                     <input
-                      value={proofsWindowSize}
-                      onChange={(event) => setProofsWindowSize(event.target.value)}
+                      value={computedWindowSize !== null ? computedWindowSize.toString() : ''}
+                      readOnly
                       placeholder={PROOFS_WINDOW.toString()}
                     />
                   </div>
@@ -1608,7 +1726,7 @@ export default function App() {
                     {searchLoading ? 'Searching...' : 'Search wallet'}
                   </button>
                 </div>
-                {(verifyTokenError || verifyIdentityError) && (
+                {showVerifyReadError && (
                   <div className="subtitle" style={{ marginTop: 8 }}>
                     On-chain read error. Check chain and contract address.
                   </div>
@@ -1640,6 +1758,11 @@ export default function App() {
                     )}
                   </div>
                 )}
+                {!searchLoading && searchRan && !searchMintLog && !searchError && (
+                  <div className="subtitle" style={{ marginTop: 8 }}>
+                    No mint events found for this wallet.
+                  </div>
+                )}
               </motion.div>
               <motion.div className="panel" variants={itemVariants}>
                 <h3>Verification policy</h3>
@@ -1667,15 +1790,21 @@ export default function App() {
                     <span className="stat-value">{totalVerified ?? 'N/A'}</span>
                   </div>
                   <div className="stat">
-                    <span className="stat-label">Onboarded (window)</span>
+                    <span className="stat-label">
+                      {proofsAllHistory ? 'Onboarded (all)' : 'Onboarded (window)'}
+                    </span>
                     <span className="stat-value">{proofsSummary.minted}</span>
                   </div>
                   <div className="stat">
-                    <span className="stat-label">Revoked (window)</span>
+                    <span className="stat-label">
+                      {proofsAllHistory ? 'Revoked (all)' : 'Revoked (window)'}
+                    </span>
                     <span className="stat-value">{proofsSummary.revoked}</span>
                   </div>
                   <div className="stat">
-                    <span className="stat-label">Auth proofs (window)</span>
+                    <span className="stat-label">
+                      {proofsAllHistory ? 'Auth proofs (all)' : 'Auth proofs (window)'}
+                    </span>
                     <span className="stat-value">{proofsSummary.auth}</span>
                   </div>
                   <div className="stat">
@@ -1687,8 +1816,17 @@ export default function App() {
                   <span className="badge">Contract: {formatWallet(IDENTITY_CONTRACT_ADDRESS)}</span>
                   <span className="badge">Chain: Base Sepolia</span>
                   <span className="badge">Head: {currentBlock ? currentBlock.toString() : 'N/A'}</span>
+                  <span className="badge">
+                    History: {proofsAllHistory ? 'All blocks' : 'Windowed'}
+                  </span>
                 </div>
                 <div style={{ marginTop: 12, display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                  <button
+                    className="button secondary"
+                    onClick={() => setProofsAllHistory((prev) => !prev)}
+                  >
+                    {proofsAllHistory ? 'Use block window' : 'Show all history'}
+                  </button>
                   <button className="button secondary" onClick={handleDownloadCsv}>
                     Download CSV
                   </button>
@@ -1720,7 +1858,7 @@ export default function App() {
                     <div className="subtitle">No proofs in this window yet.</div>
                   )}
                   {!proofsLoading &&
-                    proofsFeed.map((item) => (
+                    pagedProofs.map((item) => (
                       <div className="table-row" key={`${item.txHash}-${item.type}`}>
                         <span className={`pill ${item.type}`}>{item.type}</span>
                         <span>{item.wallet ? formatWallet(item.wallet) : 'Unknown'}</span>
@@ -1739,6 +1877,32 @@ export default function App() {
                       </div>
                     ))}
                 </div>
+                {!proofsLoading && proofsFeed.length > 0 && (
+                  <div style={{ marginTop: 16, display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+                    <button
+                      className="button secondary"
+                      onClick={() => setProofPage((prev) => Math.max(1, prev - 1))}
+                    >
+                      Prev page
+                    </button>
+                    <button
+                      className="button secondary"
+                      onClick={() => setProofPage((prev) => Math.min(proofTotalPages, prev + 1))}
+                    >
+                      Next page
+                    </button>
+                    <span className="badge">
+                      Page {proofPage} / {proofTotalPages}
+                    </span>
+                    <input
+                      style={{ maxWidth: 120 }}
+                      value={proofPageSize}
+                      onChange={(event) =>
+                        setProofPageSize(Math.max(1, Number(event.target.value) || 5))
+                      }
+                    />
+                  </div>
+                )}
               </motion.div>
               <motion.div className="panel" variants={itemVariants}>
                 <h3>Realtime auth intent</h3>

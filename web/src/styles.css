@@ -51,14 +51,15 @@ body {
 }
 
 .logo {
-  width: 48px;
-  height: 48px;
+  width: 72px;
+  height: 72px;
   border-radius: 14px;
   background: linear-gradient(135deg, var(--accent), var(--accent-2));
   display: grid;
   place-items: center;
   color: #0b1120;
-  font-weight: 700;
+  font-weight: 900;
+  font-size: 24px;
 }
 
 .title {
